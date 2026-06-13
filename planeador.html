@@ -73,8 +73,10 @@
         .palette { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
         .color-item { display: flex; flex-direction: column; align-items: center; }
         .color-number { font-size: 12px; color: #aaa; margin-bottom: 3px; }
-        .color-swatch { width: 30px; height: 30px; border-radius: 4px; border: 1px solid #000; }
-    </style>
+        .color-swatch { width: 30px; height: 30px; border-radius: 4px; border: 1px solid #000; cursor: pointer; }
+        .color-swatch:hover { border-color: #fff; }
+        input[type="color"] { border: none; width: 0; height: 0; padding: 0; visibility: hidden; position: absolute; }
+</style>
 </head>
 <body>
 
@@ -105,6 +107,7 @@
             <label>Paleta Detetada:</label>
             <div id="paletteContainer" class="palette"></div>
         </div>
+        <input type="color" id="colorPicker" value="#000000">
     </div>
 
     <div class="main-area">
@@ -119,6 +122,8 @@
         let originalImage = new Image();
         let currentGrid = [];
         let currentPalette = [];
+        let customPalette = [];
+        let paletteElements = [];
         let cols = 0, rows = 0;
 
         // Carregar imagem
@@ -169,6 +174,7 @@
 
             const { centroids, assignments } = kMeans(pixels, k);
             currentPalette = centroids;
+            customPalette = [];
             
             // Construir matriz bidimensional (Grid)
             currentGrid = [];
@@ -278,7 +284,10 @@
 
         function renderPaletteUI() {
             const container = document.getElementById('paletteContainer');
+            const colorPicker = document.getElementById('colorPicker');
             container.innerHTML = '';
+            paletteElements = [];
+            
             currentPalette.forEach((color, idx) => {
                 const item = document.createElement('div');
                 item.className = 'color-item';
@@ -287,11 +296,39 @@
                 num.textContent = idx + 1;
                 const div = document.createElement('div');
                 div.className = 'color-swatch';
-                div.style.backgroundColor = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
-                div.title = `Cor ${idx + 1}`;
+                const customColor = customPalette[idx] !== undefined ? customPalette[idx] : color;
+                div.style.backgroundColor = `rgb(${customColor[0]}, ${customColor[1]}, ${customColor[2]})`;
+                div.title = `Clique para alterar Cor ${idx + 1}`;
                 item.appendChild(num);
                 item.appendChild(div);
                 container.appendChild(item);
+                paletteElements[idx] = div;
+            });
+            
+            paletteElements.forEach((swatch, idx) => {
+                if (!swatch) return;
+                swatch.onclick = null;
+                swatch.addEventListener('click', () => {
+                    const customColor = customPalette[idx] !== undefined ? customPalette[idx] : currentPalette[idx];
+                    const toHex = (n) => n.toString(16).padStart(2, '0');
+                    colorPicker.value = '#' + toHex(customColor[0]) + toHex(customColor[1]) + toHex(customColor[2]);
+                    colorPicker.dataset.colorIndex = String(idx);
+                    colorPicker.click();
+                });
+            });
+            
+            colorPicker.oninput = null;
+            colorPicker.addEventListener('change', (e) => {
+                const idx = parseInt(e.target.dataset.colorIndex);
+                if (isNaN(idx)) return;
+                const hex = e.target.value.replace('#', '');
+                const r = parseInt(hex.substr(0, 2), 16);
+                const g = parseInt(hex.substr(2, 2), 16);
+                const b = parseInt(hex.substr(4, 2), 16);
+                currentPalette[idx] = [r, g, b];
+                customPalette[idx] = [r, g, b];
+                renderPaletteUI();
+                drawGrid();
             });
         }
 
