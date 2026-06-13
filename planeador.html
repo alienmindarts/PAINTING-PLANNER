@@ -69,6 +69,7 @@
             transition: background 0.2s;
         }
         button:hover { background-color: #008cd6; }
+        button:disabled { background-color: #666; cursor: wait; }
         .file-input { margin-bottom: 10px; }
         .palette { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
         .color-item { display: flex; flex-direction: column; align-items: center; }
@@ -117,251 +118,503 @@
     <script>
         const imageUpload = document.getElementById('imageUpload');
         const displayCanvas = document.getElementById('displayCanvas');
-        const ctx = displayCanvas.getContext('2d');
-        
-        let originalImage = new Image();
-        let currentGrid = [];
+        const ctx = displayCanvas.getContext('2d', { alpha: false });
+        const resInput = document.getElementById('resInput');
+        const colorsInput = document.getElementById('colorsInput');
+        const gridOpacityInput = document.getElementById('gridOpacity');
+        const processBtn = document.getElementById('processBtn');
+        const exportSvgBtn = document.getElementById('exportSvgBtn');
+        const paletteContainer = document.getElementById('paletteContainer');
+        const colorPicker = document.getElementById('colorPicker');
+
+        let originalImage = null;
+        let currentGrid = new Uint8Array();
         let currentPalette = [];
         let customPalette = [];
         let paletteElements = [];
-        let cols = 0, rows = 0;
+        let cols = 0;
+        let rows = 0;
+        let gridDrawQueued = false;
+        let kMeansWorker = null;
+        let kMeansRequestId = 0;
+        let isProcessing = false;
 
-        // Carregar imagem
-        imageUpload.addEventListener('change', (e) => {
-            const file = e.target.files[0];
+        imageUpload.addEventListener('change', loadImageFile);
+        processBtn.addEventListener('click', processImage);
+        gridOpacityInput.addEventListener('input', scheduleDrawGrid);
+        exportSvgBtn.addEventListener('click', exportSVG);
+        colorPicker.addEventListener('change', handleColorPickerChange);
+
+        function loadImageFile(event) {
+            const file = event.target.files && event.target.files[0];
             if (!file) return;
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                originalImage.src = event.target.result;
-                originalImage.onload = () => processImage();
-            };
-            reader.readAsDataURL(file);
-        });
 
-        document.getElementById('processBtn').addEventListener('click', processImage);
-        document.getElementById('gridOpacity').addEventListener('input', drawGrid);
-        document.getElementById('exportSvgBtn').addEventListener('click', exportSVG);
+            const url = URL.createObjectURL(file);
+            const img = new Image();
+            img.onload = () => {
+                originalImage = img;
+                URL.revokeObjectURL(url);
+                processImage();
+            };
+            img.onerror = () => {
+                URL.revokeObjectURL(url);
+                alert('Não foi possível carregar esta imagem.');
+            };
+            img.src = url;
+        }
 
         function processImage() {
-            if (!originalImage.src) return;
+            if (isProcessing || !originalImage || !originalImage.naturalWidth) return;
 
-            const resMax = parseInt(document.getElementById('resInput').value);
-            const k = parseInt(document.getElementById('colorsInput').value);
+            const resMax = clamp(parseInt(resInput.value, 10), 10, 150);
+            const k = clamp(parseInt(colorsInput.value, 10), 2, 32);
 
-            // 1. Calcular Proporções
-            const ratio = originalImage.width / originalImage.height;
+            const ratio = originalImage.naturalWidth / originalImage.naturalHeight;
             if (ratio >= 1) {
                 cols = resMax;
-                rows = Math.round(resMax / ratio);
+                rows = Math.max(1, Math.round(resMax / ratio));
             } else {
                 rows = resMax;
-                cols = Math.round(resMax * ratio);
+                cols = Math.max(1, Math.round(resMax * ratio));
             }
 
-            // 2. Desenhar num canvas oculto para "pixelizar"
             const offCanvas = document.createElement('canvas');
             offCanvas.width = cols;
             offCanvas.height = rows;
-            const offCtx = offCanvas.getContext('2d');
+            const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+            offCtx.imageSmoothingEnabled = true;
             offCtx.drawImage(originalImage, 0, 0, cols, rows);
 
-            // 3. Extrair dados e aplicar K-Means
-            const imgData = offCtx.getImageData(0, 0, cols, rows);
-            const pixels = [];
-            for (let i = 0; i < imgData.data.length; i += 4) {
-                pixels.push([imgData.data[i], imgData.data[i+1], imgData.data[i+2]]);
+            const imageData = offCtx.getImageData(0, 0, cols, rows);
+            const pixels = new Uint8ClampedArray((imageData.width * imageData.height) * 3);
+            let pixelOffset = 0;
+            for (let i = 0; i < imageData.data.length; i += 4) {
+                pixels[pixelOffset++] = imageData.data[i];
+                pixels[pixelOffset++] = imageData.data[i + 1];
+                pixels[pixelOffset++] = imageData.data[i + 2];
             }
 
-            const { centroids, assignments } = kMeans(pixels, k);
-            currentPalette = centroids;
-            customPalette = [];
-            
-            // Construir matriz bidimensional (Grid)
-            currentGrid = [];
-            let pixelIndex = 0;
-            for (let y = 0; y < rows; y++) {
-                let row = [];
-                for (let x = 0; x < cols; x++) {
-                    row.push(assignments[pixelIndex]);
-                    pixelIndex++;
-                }
-                currentGrid.push(row);
-            }
+            setProcessing(true);
 
-            renderPaletteUI();
-            drawGrid();
+            runKMeans(pixels, k)
+                .then(({ centroids, assignments }) => {
+                    currentPalette = centroidsToArrays(centroids, k);
+                    customPalette = new Array(k);
+                    currentGrid = assignments;
+                    renderPaletteUI();
+                    drawGrid();
+                })
+                .catch((error) => {
+                    console.error(error);
+                    alert('O processamento falhou. Tenta reduzir a resolução ou o número de cores.');
+                })
+                .finally(() => {
+                    setProcessing(false);
+                });
         }
 
-        // Função principal de desenho
-        function drawGrid() {
-            if (currentGrid.length === 0) return;
+        function setProcessing(value) {
+            isProcessing = value;
+            processBtn.disabled = value;
+            exportSvgBtn.disabled = value;
+            imageUpload.disabled = value;
+            processBtn.textContent = value ? 'A processar...' : 'Processar Imagem';
+        }
 
-            const cellSize = Math.floor(Math.min(800 / cols, 800 / rows)); // Escalar para visualização
-            displayCanvas.width = cols * cellSize;
-            displayCanvas.height = rows * cellSize;
-            const opacity = document.getElementById('gridOpacity').value;
+        function runKMeans(pixels, k) {
+            try {
+                const worker = getKMeansWorker();
+                const requestId = ++kMeansRequestId;
 
-            ctx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
-            ctx.font = `${cellSize * 0.4}px Arial`;
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
+                return new Promise((resolve, reject) => {
+                    const onMessage = (event) => {
+                        if (event.data.requestId !== requestId) return;
+                        worker.removeEventListener('message', onMessage);
+                        worker.removeEventListener('error', onError);
+                        resolve(event.data);
+                    };
 
-            for (let y = 0; y < rows; y++) {
-                for (let x = 0; x < cols; x++) {
-                    const colorIndex = currentGrid[y][x];
-                    const color = currentPalette[colorIndex];
-                    
-                    // Desenhar fundo da célula
-                    ctx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
-                    ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+                    const onError = (event) => {
+                        kMeansWorker = null;
+                        worker.removeEventListener('message', onMessage);
+                        worker.removeEventListener('error', onError);
+                        reject(new Error(event.message || 'Erro no worker de processamento.'));
+                    };
 
-                    // Desenhar contorno da grelha
-                    ctx.strokeStyle = `rgba(0, 0, 0, ${opacity})`;
-                    ctx.lineWidth = 1;
-                    ctx.strokeRect(x * cellSize, y * cellSize, cellSize, cellSize);
-
-                    // Determinar cor do texto (Contraste)
-                    const luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
-                    ctx.fillStyle = luma > 128 ? 'rgba(0,0,0,0.7)' : 'rgba(255,255,255,0.7)';
-                    
-                    // Desenhar número
-                    ctx.fillText(colorIndex + 1, x * cellSize + cellSize / 2, y * cellSize + cellSize / 2);
+                    worker.addEventListener('message', onMessage);
+                    worker.addEventListener('error', onError);
+                    worker.postMessage({ requestId, pixels, k, maxIterations: 12 }, [pixels.buffer]);
+                });
+            } catch (error) {
+                try {
+                    return Promise.resolve(kMeansSync(pixels, k));
+                } catch (syncError) {
+                    return Promise.reject(syncError);
                 }
             }
         }
 
-        // --- Algoritmo K-Means Simples ---
-        function kMeans(pixels, k, maxIterations = 10) {
-            let centroids = [];
-            // Inicialização aleatória dos centroides
-            for (let i = 0; i < k; i++) {
-                centroids.push(pixels[Math.floor(Math.random() * pixels.length)]);
+        function getKMeansWorker() {
+            if (kMeansWorker) return kMeansWorker;
+
+            const workerSource = `
+self.onmessage = function(event) {
+    const data = event.data;
+    const pixels = data.pixels;
+    const k = data.k;
+    const maxIterations = data.maxIterations;
+    const n = pixels.length / 3;
+    const centroids = new Float32Array(k * 3);
+    const assignments = new Uint8Array(n);
+    const sums = new Float32Array(k * 3);
+    const counts = new Uint32Array(k);
+
+    for (let j = 0; j < k; j++) {
+        const src = ((j * n) / k | 0) * 3;
+        centroids[j * 3] = pixels[src];
+        centroids[j * 3 + 1] = pixels[src + 1];
+        centroids[j * 3 + 2] = pixels[src + 2];
+    }
+
+    for (let iter = 0; iter < maxIterations; iter++) {
+        sums.fill(0);
+        counts.fill(0);
+
+        for (let i = 0; i < n; i++) {
+            const p = i * 3;
+            const r = pixels[p];
+            const g = pixels[p + 1];
+            const b = pixels[p + 2];
+
+            let minDist = Infinity;
+            let clusterIndex = 0;
+
+            for (let j = 0; j < k; j++) {
+                const c = j * 3;
+                const dr = r - centroids[c];
+                const dg = g - centroids[c + 1];
+                const db = b - centroids[c + 2];
+                const dist = dr * dr + dg * dg + db * db;
+
+                if (dist < minDist) {
+                    minDist = dist;
+                    clusterIndex = j;
+                }
             }
 
-            let assignments = new Array(pixels.length);
-            for (let iter = 0; iter < maxIterations; iter++) {
-                let clusters = Array.from({ length: k }, () => []);
-                
-                // Atribuir pixéis ao centroide mais próximo
-                for (let i = 0; i < pixels.length; i++) {
+            assignments[i] = clusterIndex;
+            const s = clusterIndex * 3;
+            sums[s] += r;
+            sums[s + 1] += g;
+            sums[s + 2] += b;
+            counts[clusterIndex]++;
+        }
+
+        let moved = false;
+
+        for (let j = 0; j < k; j++) {
+            const c = j * 3;
+
+            if (counts[j] === 0) {
+                const src = ((j * n) / k | 0) * 3;
+                centroids[c] = pixels[src];
+                centroids[c + 1] = pixels[src + 1];
+                centroids[c + 2] = pixels[src + 2];
+                moved = true;
+                continue;
+            }
+
+            const nr = Math.round(sums[c] / counts[j]);
+            const ng = Math.round(sums[c + 1] / counts[j]);
+            const nb = Math.round(sums[c + 2] / counts[j]);
+
+            if (nr !== centroids[c] || ng !== centroids[c + 1] || nb !== centroids[c + 2]) {
+                moved = true;
+            }
+
+            centroids[c] = nr;
+            centroids[c + 1] = ng;
+            centroids[c + 2] = nb;
+        }
+
+        if (!moved) break;
+    }
+
+    self.postMessage({ requestId: data.requestId, centroids, assignments }, [centroids.buffer, assignments.buffer]);
+};
+`;
+
+            const blob = new Blob([workerSource], { type: 'application/javascript' });
+            kMeansWorker = new Worker(URL.createObjectURL(blob));
+            return kMeansWorker;
+        }
+
+        function kMeansSync(pixels, k) {
+            const n = pixels.length / 3;
+            const centroids = new Float32Array(k * 3);
+            const assignments = new Uint8Array(n);
+            const sums = new Float32Array(k * 3);
+            const counts = new Uint32Array(k);
+
+            for (let j = 0; j < k; j++) {
+                const src = ((j * n) / k | 0) * 3;
+                centroids[j * 3] = pixels[src];
+                centroids[j * 3 + 1] = pixels[src + 1];
+                centroids[j * 3 + 2] = pixels[src + 2];
+            }
+
+            for (let iter = 0; iter < 12; iter++) {
+                sums.fill(0);
+                counts.fill(0);
+
+                for (let i = 0; i < n; i++) {
+                    const p = i * 3;
+                    const r = pixels[p];
+                    const g = pixels[p + 1];
+                    const b = pixels[p + 2];
+
                     let minDist = Infinity;
                     let clusterIndex = 0;
+
                     for (let j = 0; j < k; j++) {
-                        let dist = colorDist(pixels[i], centroids[j]);
+                        const c = j * 3;
+                        const dr = r - centroids[c];
+                        const dg = g - centroids[c + 1];
+                        const db = b - centroids[c + 2];
+                        const dist = dr * dr + dg * dg + db * db;
+
                         if (dist < minDist) {
                             minDist = dist;
                             clusterIndex = j;
                         }
                     }
+
                     assignments[i] = clusterIndex;
-                    clusters[clusterIndex].push(pixels[i]);
+                    const s = clusterIndex * 3;
+                    sums[s] += r;
+                    sums[s + 1] += g;
+                    sums[s + 2] += b;
+                    counts[clusterIndex]++;
                 }
 
-                // Recalcular centroides
                 let moved = false;
                 for (let j = 0; j < k; j++) {
-                    if (clusters[j].length === 0) continue;
-                    let r = 0, g = 0, b = 0;
-                    for (let p of clusters[j]) {
-                        r += p[0]; g += p[1]; b += p[2];
+                    const c = j * 3;
+                    if (counts[j] === 0) continue;
+
+                    const nr = Math.round(sums[c] / counts[j]);
+                    const ng = Math.round(sums[c + 1] / counts[j]);
+                    const nb = Math.round(sums[c + 2] / counts[j]);
+
+                    if (nr !== centroids[c] || ng !== centroids[c + 1] || nb !== centroids[c + 2]) {
+                        moved = true;
                     }
-                    let newCentroid = [
-                        Math.round(r / clusters[j].length),
-                        Math.round(g / clusters[j].length),
-                        Math.round(b / clusters[j].length)
-                    ];
-                    if (colorDist(centroids[j], newCentroid) > 0) moved = true;
-                    centroids[j] = newCentroid;
+
+                    centroids[c] = nr;
+                    centroids[c + 1] = ng;
+                    centroids[c + 2] = nb;
                 }
+
                 if (!moved) break;
             }
+
             return { centroids, assignments };
         }
 
-        function colorDist(c1, c2) {
-            return Math.pow(c1[0]-c2[0], 2) + Math.pow(c1[1]-c2[1], 2) + Math.pow(c1[2]-c2[2], 2);
+        function centroidsToArrays(centroids, k) {
+            const result = [];
+            for (let i = 0; i < k; i++) {
+                result.push([
+                    Math.round(centroids[i * 3]),
+                    Math.round(centroids[i * 3 + 1]),
+                    Math.round(centroids[i * 3 + 2])
+                ]);
+            }
+            return result;
+        }
+
+        function clamp(value, min, max) {
+            if (!Number.isFinite(value)) return min;
+            return Math.min(max, Math.max(min, value));
+        }
+
+        function scheduleDrawGrid() {
+            if (gridDrawQueued) return;
+            gridDrawQueued = true;
+            requestAnimationFrame(() => {
+                gridDrawQueued = false;
+                drawGrid();
+            });
+        }
+
+        function drawGrid() {
+            if (currentGrid.length === 0 || currentPalette.length === 0) return;
+
+            const cellSize = Math.max(1, Math.floor(Math.min(800 / cols, 800 / rows)));
+            const width = cols * cellSize;
+            const height = rows * cellSize;
+
+            if (displayCanvas.width !== width || displayCanvas.height !== height) {
+                displayCanvas.width = width;
+                displayCanvas.height = height;
+            } else {
+                ctx.clearRect(0, 0, width, height);
+            }
+
+            const image = ctx.createImageData(width, height);
+            const imageData = image.data;
+
+            for (let y = 0; y < rows; y++) {
+                const rowOffset = y * cols;
+
+                for (let x = 0; x < cols; x++) {
+                    const color = currentPalette[currentGrid[rowOffset + x]];
+                    const startX = x * cellSize;
+                    const startY = y * cellSize;
+
+                    for (let yy = 0; yy < cellSize; yy++) {
+                        let pixelIndex = ((startY + yy) * width + startX) * 4;
+
+                        for (let xx = 0; xx < cellSize; xx++) {
+                            imageData[pixelIndex] = color[0];
+                            imageData[pixelIndex + 1] = color[1];
+                            imageData[pixelIndex + 2] = color[2];
+                            imageData[pixelIndex + 3] = 255;
+                            pixelIndex += 4;
+                        }
+                    }
+                }
+            }
+
+            ctx.putImageData(image, 0, 0);
+
+            const opacity = Number(gridOpacityInput.value);
+            if (opacity > 0) {
+                ctx.save();
+                ctx.strokeStyle = `rgba(0, 0, 0, ${opacity})`;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+
+                for (let x = 0; x <= cols; x++) {
+                    const px = x * cellSize + 0.5;
+                    ctx.moveTo(px, 0);
+                    ctx.lineTo(px, height);
+                }
+
+                for (let y = 0; y <= rows; y++) {
+                    const py = y * cellSize + 0.5;
+                    ctx.moveTo(0, py);
+                    ctx.lineTo(width, py);
+                }
+
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            if (cellSize >= 8) {
+                ctx.save();
+                ctx.font = `${cellSize * 0.4}px Arial`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+
+                for (let y = 0; y < rows; y++) {
+                    const rowOffset = y * cols;
+
+                    for (let x = 0; x < cols; x++) {
+                        const color = currentPalette[currentGrid[rowOffset + x]];
+                        const luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+                        ctx.fillStyle = luma > 128 ? 'rgba(0,0,0,0.7)' : 'rgba(255,255,255,0.7)';
+                        ctx.fillText(currentGrid[rowOffset + x] + 1, x * cellSize + cellSize / 2, y * cellSize + cellSize / 2);
+                    }
+                }
+
+                ctx.restore();
+            }
         }
 
         function renderPaletteUI() {
-            const container = document.getElementById('paletteContainer');
-            const colorPicker = document.getElementById('colorPicker');
-            container.innerHTML = '';
+            paletteContainer.innerHTML = '';
             paletteElements = [];
-            
+
             currentPalette.forEach((color, idx) => {
                 const item = document.createElement('div');
                 item.className = 'color-item';
+
                 const num = document.createElement('span');
                 num.className = 'color-number';
                 num.textContent = idx + 1;
+
                 const div = document.createElement('div');
                 div.className = 'color-swatch';
                 const customColor = customPalette[idx] !== undefined ? customPalette[idx] : color;
                 div.style.backgroundColor = `rgb(${customColor[0]}, ${customColor[1]}, ${customColor[2]})`;
                 div.title = `Clique para alterar Cor ${idx + 1}`;
+
                 item.appendChild(num);
                 item.appendChild(div);
-                container.appendChild(item);
+                paletteContainer.appendChild(item);
                 paletteElements[idx] = div;
             });
-            
+
             paletteElements.forEach((swatch, idx) => {
-                if (!swatch) return;
                 swatch.onclick = null;
                 swatch.addEventListener('click', () => {
                     const customColor = customPalette[idx] !== undefined ? customPalette[idx] : currentPalette[idx];
                     const toHex = (n) => n.toString(16).padStart(2, '0');
-                    colorPicker.value = '#' + toHex(customColor[0]) + toHex(customColor[1]) + toHex(customColor[2]);
+                    colorPicker.value = `#${toHex(customColor[0])}${toHex(customColor[1])}${toHex(customColor[2])}`;
                     colorPicker.dataset.colorIndex = String(idx);
                     colorPicker.click();
                 });
             });
-            
-            colorPicker.oninput = null;
-            colorPicker.addEventListener('change', (e) => {
-                const idx = parseInt(e.target.dataset.colorIndex);
-                if (isNaN(idx)) return;
-                const hex = e.target.value.replace('#', '');
-                const r = parseInt(hex.substr(0, 2), 16);
-                const g = parseInt(hex.substr(2, 2), 16);
-                const b = parseInt(hex.substr(4, 2), 16);
-                currentPalette[idx] = [r, g, b];
-                customPalette[idx] = [r, g, b];
-                renderPaletteUI();
-                drawGrid();
-            });
         }
 
-        // --- Exportação SVG ---
-        function exportSVG() {
-            if (currentGrid.length === 0) return alert("Processa uma imagem primeiro!");
+        function handleColorPickerChange(event) {
+            const idx = parseInt(event.target.dataset.colorIndex, 10);
+            if (Number.isNaN(idx) || !currentPalette[idx]) return;
 
-            const cellSize = 20; // Tamanho base para impressão
+            const hex = event.target.value.replace('#', '');
+            const r = parseInt(hex.substr(0, 2), 16);
+            const g = parseInt(hex.substr(2, 2), 16);
+            const b = parseInt(hex.substr(4, 2), 16);
+            const color = [r, g, b];
+
+            currentPalette[idx] = color;
+            customPalette[idx] = color;
+
+            if (paletteElements[idx]) {
+                paletteElements[idx].style.backgroundColor = `rgb(${r}, ${g}, ${b})`;
+            }
+
+            drawGrid();
+        }
+
+        function exportSVG() {
+            if (currentGrid.length === 0) return alert('Processa uma imagem primeiro!');
+
+            const cellSize = 20;
             const width = cols * cellSize;
             const height = rows * cellSize;
-
-            let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">\n`;
-            
-            // Fundo Branco
-            svg += `<rect width="${width}" height="${height}" fill="#ffffff" />\n`;
+            const parts = [
+                `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">`,
+                `<rect width="${width}" height="${height}" fill="#ffffff" />`
+            ];
 
             for (let y = 0; y < rows; y++) {
+                const rowOffset = y * cols;
+
                 for (let x = 0; x < cols; x++) {
-                    const id = currentGrid[y][x] + 1;
+                    const id = currentGrid[rowOffset + x] + 1;
                     const cx = x * cellSize;
                     const cy = y * cellSize;
-                    
-                    // Célula (Grelha)
-                    svg += `<rect x="${cx}" y="${cy}" width="${cellSize}" height="${cellSize}" fill="none" stroke="#000000" stroke-width="0.5" stroke-opacity="0.3"/>\n`;
-                    
-                    // Texto (Número centrado)
-                    svg += `<text x="${cx + cellSize/2}" y="${cy + cellSize/2}" font-family="Arial" font-size="${cellSize * 0.4}" fill="#000000" text-anchor="middle" dominant-baseline="central">${id}</text>\n`;
+
+                    parts.push(`<rect x="${cx}" y="${cy}" width="${cellSize}" height="${cellSize}" fill="none" stroke="#000000" stroke-width="0.5" stroke-opacity="0.3"/>`);
+                    parts.push(`<text x="${cx + cellSize / 2}" y="${cy + cellSize / 2}" font-family="Arial" font-size="${cellSize * 0.4}" fill="#000000" text-anchor="middle" dominant-baseline="central">${id}</text>`);
                 }
             }
-            svg += `</svg>`;
 
-            // Forçar Download
-            const blob = new Blob([svg], { type: 'image/svg+xml' });
+            parts.push('</svg>');
+
+            const blob = new Blob([parts.join('\n')], { type: 'image/svg+xml' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -369,7 +622,7 @@
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
-            URL.revokeObjectURL(url);
+            setTimeout(() => URL.revokeObjectURL(url), 0);
         }
     </script>
 </body>
