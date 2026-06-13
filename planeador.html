@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Planeador de Pintura</title>
+    <style>
+        :root {
+            --bg-color: #1e1e24;
+            --panel-bg: #2b2b36;
+            --text-color: #e0e0e0;
+            --accent: #00a8ff;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            gap: 20px;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+        .sidebar {
+            width: 320px;
+            background-color: var(--panel-bg);
+            padding: 20px;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            overflow-y: auto;
+        }
+        .main-area {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: #121215;
+            border-radius: 8px;
+            overflow: hidden;
+            padding: 20px;
+        }
+        canvas {
+            max-width: 100%;
+            max-height: 100%;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        label { display: block; font-size: 14px; margin-bottom: 5px; color: #aaa; }
+        input[type="number"], input[type="range"] {
+            width: 100%;
+            padding: 8px;
+            background: #1e1e24;
+            border: 1px solid #444;
+            color: white;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: var(--accent);
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: #008cd6; }
+        .file-input { margin-bottom: 10px; }
+        .palette { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+        .color-swatch { width: 30px; height: 30px; border-radius: 4px; border: 1px solid #000; }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <h2>Controlos</h2>
+        
+        <input type="file" id="imageUpload" class="file-input" accept="image/*">
+        
+        <div>
+            <label>Resolução (Células no lado maior):</label>
+            <input type="number" id="resInput" value="50" min="10" max="150">
+        </div>
+        
+        <div>
+            <label>Máximo de Cores (K):</label>
+            <input type="number" id="colorsInput" value="8" min="2" max="32">
+        </div>
+
+        <div>
+            <label>Opacidade da Grelha:</label>
+            <input type="range" id="gridOpacity" min="0" max="1" step="0.1" value="0.5">
+        </div>
+        
+        <button id="processBtn">Processar Imagem</button>
+        <button id="exportSvgBtn" style="background-color: #4CAF50;">Exportar SVG (Impressão)</button>
+
+        <div>
+            <label>Paleta Detetada:</label>
+            <div id="paletteContainer" class="palette"></div>
+        </div>
+    </div>
+
+    <div class="main-area">
+        <canvas id="displayCanvas"></canvas>
+    </div>
+
+    <script>
+        const imageUpload = document.getElementById('imageUpload');
+        const displayCanvas = document.getElementById('displayCanvas');
+        const ctx = displayCanvas.getContext('2d');
+        
+        let originalImage = new Image();
+        let currentGrid = [];
+        let currentPalette = [];
+        let cols = 0, rows = 0;
+
+        // Carregar imagem
+        imageUpload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                originalImage.src = event.target.result;
+                originalImage.onload = () => processImage();
+            };
+            reader.readAsDataURL(file);
+        });
+
+        document.getElementById('processBtn').addEventListener('click', processImage);
+        document.getElementById('gridOpacity').addEventListener('input', drawGrid);
+        document.getElementById('exportSvgBtn').addEventListener('click', exportSVG);
+
+        function processImage() {
+            if (!originalImage.src) return;
+
+            const resMax = parseInt(document.getElementById('resInput').value);
+            const k = parseInt(document.getElementById('colorsInput').value);
+
+            // 1. Calcular Proporções
+            const ratio = originalImage.width / originalImage.height;
+            if (ratio >= 1) {
+                cols = resMax;
+                rows = Math.round(resMax / ratio);
+            } else {
+                rows = resMax;
+                cols = Math.round(resMax * ratio);
+            }
+
+            // 2. Desenhar num canvas oculto para "pixelizar"
+            const offCanvas = document.createElement('canvas');
+            offCanvas.width = cols;
+            offCanvas.height = rows;
+            const offCtx = offCanvas.getContext('2d');
+            offCtx.drawImage(originalImage, 0, 0, cols, rows);
+
+            // 3. Extrair dados e aplicar K-Means
+            const imgData = offCtx.getImageData(0, 0, cols, rows);
+            const pixels = [];
+            for (let i = 0; i < imgData.data.length; i += 4) {
+                pixels.push([imgData.data[i], imgData.data[i+1], imgData.data[i+2]]);
+            }
+
+            const { centroids, assignments } = kMeans(pixels, k);
+            currentPalette = centroids;
+            
+            // Construir matriz bidimensional (Grid)
+            currentGrid = [];
+            let pixelIndex = 0;
+            for (let y = 0; y < rows; y++) {
+                let row = [];
+                for (let x = 0; x < cols; x++) {
+                    row.push(assignments[pixelIndex]);
+                    pixelIndex++;
+                }
+                currentGrid.push(row);
+            }
+
+            renderPaletteUI();
+            drawGrid();
+        }
+
+        // Função principal de desenho
+        function drawGrid() {
+            if (currentGrid.length === 0) return;
+
+            const cellSize = Math.floor(Math.min(800 / cols, 800 / rows)); // Escalar para visualização
+            displayCanvas.width = cols * cellSize;
+            displayCanvas.height = rows * cellSize;
+            const opacity = document.getElementById('gridOpacity').value;
+
+            ctx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
+            ctx.font = `${cellSize * 0.4}px Arial`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+
+            for (let y = 0; y < rows; y++) {
+                for (let x = 0; x < cols; x++) {
+                    const colorIndex = currentGrid[y][x];
+                    const color = currentPalette[colorIndex];
+                    
+                    // Desenhar fundo da célula
+                    ctx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+                    ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+
+                    // Desenhar contorno da grelha
+                    ctx.strokeStyle = `rgba(0, 0, 0, ${opacity})`;
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(x * cellSize, y * cellSize, cellSize, cellSize);
+
+                    // Determinar cor do texto (Contraste)
+                    const luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+                    ctx.fillStyle = luma > 128 ? 'rgba(0,0,0,0.7)' : 'rgba(255,255,255,0.7)';
+                    
+                    // Desenhar número
+                    ctx.fillText(colorIndex + 1, x * cellSize + cellSize / 2, y * cellSize + cellSize / 2);
+                }
+            }
+        }
+
+        // --- Algoritmo K-Means Simples ---
+        function kMeans(pixels, k, maxIterations = 10) {
+            let centroids = [];
+            // Inicialização aleatória dos centroides
+            for (let i = 0; i < k; i++) {
+                centroids.push(pixels[Math.floor(Math.random() * pixels.length)]);
+            }
+
+            let assignments = new Array(pixels.length);
+            for (let iter = 0; iter < maxIterations; iter++) {
+                let clusters = Array.from({ length: k }, () => []);
+                
+                // Atribuir pixéis ao centroide mais próximo
+                for (let i = 0; i < pixels.length; i++) {
+                    let minDist = Infinity;
+                    let clusterIndex = 0;
+                    for (let j = 0; j < k; j++) {
+                        let dist = colorDist(pixels[i], centroids[j]);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            clusterIndex = j;
+                        }
+                    }
+                    assignments[i] = clusterIndex;
+                    clusters[clusterIndex].push(pixels[i]);
+                }
+
+                // Recalcular centroides
+                let moved = false;
+                for (let j = 0; j < k; j++) {
+                    if (clusters[j].length === 0) continue;
+                    let r = 0, g = 0, b = 0;
+                    for (let p of clusters[j]) {
+                        r += p[0]; g += p[1]; b += p[2];
+                    }
+                    let newCentroid = [
+                        Math.round(r / clusters[j].length),
+                        Math.round(g / clusters[j].length),
+                        Math.round(b / clusters[j].length)
+                    ];
+                    if (colorDist(centroids[j], newCentroid) > 0) moved = true;
+                    centroids[j] = newCentroid;
+                }
+                if (!moved) break;
+            }
+            return { centroids, assignments };
+        }
+
+        function colorDist(c1, c2) {
+            return Math.pow(c1[0]-c2[0], 2) + Math.pow(c1[1]-c2[1], 2) + Math.pow(c1[2]-c2[2], 2);
+        }
+
+        function renderPaletteUI() {
+            const container = document.getElementById('paletteContainer');
+            container.innerHTML = '';
+            currentPalette.forEach((color, idx) => {
+                const div = document.createElement('div');
+                div.className = 'color-swatch';
+                div.style.backgroundColor = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+                div.title = `Cor ${idx + 1}`;
+                container.appendChild(div);
+            });
+        }
+
+        // --- Exportação SVG ---
+        function exportSVG() {
+            if (currentGrid.length === 0) return alert("Processa uma imagem primeiro!");
+
+            const cellSize = 20; // Tamanho base para impressão
+            const width = cols * cellSize;
+            const height = rows * cellSize;
+
+            let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">\n`;
+            
+            // Fundo Branco
+            svg += `<rect width="${width}" height="${height}" fill="#ffffff" />\n`;
+
+            for (let y = 0; y < rows; y++) {
+                for (let x = 0; x < cols; x++) {
+                    const id = currentGrid[y][x] + 1;
+                    const cx = x * cellSize;
+                    const cy = y * cellSize;
+                    
+                    // Célula (Grelha)
+                    svg += `<rect x="${cx}" y="${cy}" width="${cellSize}" height="${cellSize}" fill="none" stroke="#000000" stroke-width="0.5" stroke-opacity="0.3"/>\n`;
+                    
+                    // Texto (Número centrado)
+                    svg += `<text x="${cx + cellSize/2}" y="${cy + cellSize/2}" font-family="Arial" font-size="${cellSize * 0.4}" fill="#000000" text-anchor="middle" dominant-baseline="central">${id}</text>\n`;
+                }
+            }
+            svg += `</svg>`;
+
+            // Forçar Download
+            const blob = new Blob([svg], { type: 'image/svg+xml' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'planeador_pintura.svg';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+    </script>
+</body>
+</html>
