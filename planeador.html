@@ -71,6 +71,8 @@
         button:hover { background-color: #008cd6; }
         .file-input { margin-bottom: 10px; }
         .palette { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+        .color-item { display: flex; flex-direction: column; align-items: center; }
+        .color-number { font-size: 12px; color: #aaa; margin-bottom: 3px; }
         .color-swatch { width: 30px; height: 30px; border-radius: 4px; border: 1px solid #000; }
     </style>
 </head>
@@ -278,11 +280,18 @@
             const container = document.getElementById('paletteContainer');
             container.innerHTML = '';
             currentPalette.forEach((color, idx) => {
+                const item = document.createElement('div');
+                item.className = 'color-item';
+                const num = document.createElement('span');
+                num.className = 'color-number';
+                num.textContent = idx + 1;
                 const div = document.createElement('div');
                 div.className = 'color-swatch';
                 div.style.backgroundColor = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
                 div.title = `Cor ${idx + 1}`;
-                container.appendChild(div);
+                item.appendChild(num);
+                item.appendChild(div);
+                container.appendChild(item);
             });
         }
 
